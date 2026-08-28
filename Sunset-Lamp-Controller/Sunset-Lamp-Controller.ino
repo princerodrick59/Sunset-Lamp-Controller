@@ -89,6 +89,24 @@ volatile bool g_colorDirty = false;
 volatile int      g_lampOn    = -1;
 volatile uint32_t g_powerCmdAt = 0;    // millis() of our last power command
 
+// ---- animated effects (rendered on core 0, one BLE frame at a time) --------
+enum FxId : int {
+  FX_NONE = 0, FX_7FADE, FX_7STROBE, FX_7JUMP, FX_BREATHE, FX_1BLINK, FX_2FADE
+};
+volatile int  g_fx      = FX_NONE;
+volatile int  g_fxSpeed = 50;          // 0..100  (50 = normal)
+volatile int  g_fxColA  = 0;           // index into FX_RGB (single colour / colour A)
+volatile int  g_fxColB  = 2;           // colour B for the two-colour fade
+volatile bool g_fxRestart = false;     // UI sets this when the effect or its inputs change
+
+// Red, Green, Blue, Yellow, Cyan, Purple, White — the lamp's own effect palette.
+static const uint8_t FX_RGB[7][3] = {
+  {255,0,0}, {0,255,0}, {0,0,255}, {255,255,0}, {0,255,255}, {160,0,255}, {255,255,255}
+};
+static const char *FX_COLOR_NAME[7] = {
+  "Red", "Green", "Blue", "Yellow", "Cyan", "Purple", "White"
+};
+
 enum BleEvt : uint8_t { EVT_CONNECT = 1, EVT_DISCONNECT, EVT_POWER_ON, EVT_POWER_OFF };
 static QueueHandle_t g_evtQ = nullptr;
 
@@ -101,6 +119,7 @@ class ClientCB : public NimBLEClientCallbacks {
     g_writeChr = nullptr;
     g_bleState = BLE_DISCONNECTED;
     g_lampOn   = -1;
+    g_fx       = FX_NONE;
   }
 };
 static ClientCB g_clientCB;
@@ -170,6 +189,105 @@ static void bleSendColor() {
   bleWrite(pkt, 21);
 }
 
+static void bleSendRGB(uint8_t R, uint8_t G, uint8_t B, int bri) {
+  float r = R / 255.0f, g = G / 255.0f, b = B / 255.0f;
+  float mx = fmaxf(r, fmaxf(g, b)), mn = fminf(r, fminf(g, b)), d = mx - mn;
+  float h = 0;
+  if (d > 1e-4f) {
+    if      (mx == r) h = 60.0f * fmodf((g - b) / d, 6.0f);
+    else if (mx == g) h = 60.0f * ((b - r) / d + 2.0f);
+    else              h = 60.0f * ((r - g) / d + 4.0f);
+  }
+  if (h < 0) h += 360.0f;
+  int s = (mx > 1e-4f) ? (int)(d / mx * 100.0f + 0.5f) : 0;
+  uint8_t pkt[21];
+  memcpy(pkt, PKT_HSV_TEMPLATE, 21);
+  pkt[10] = (uint8_t)(((int)(h + 0.5f) % 360) / 2);
+  pkt[11] = (uint8_t)constrain(s, 0, 100);
+  pkt[12] = (uint8_t)constrain(bri, 0, 100);
+  bleWrite(pkt, 21);
+}
+
+/* ---- effect engine : one frame per call, own pacing ---------------------- */
+
+// speed 0..100 -> 0.05x .. 5x, like the Python app
+static uint32_t fxScaledMs(float baseSec) {
+  float f = fmaxf(0.05f, g_fxSpeed / 100.0f * 5.0f);
+  return (uint32_t)(fmaxf(0.01f, baseSec / f) * 1000.0f);
+}
+
+// sleep in small slices so Stop / a param change is picked up promptly
+static void fxDelay(uint32_t ms) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    if (g_fx == FX_NONE || g_fxRestart || g_bleState != BLE_CONNECTED) return;
+    vTaskDelay(pdMS_TO_TICKS(12));
+  }
+}
+
+static inline void fxLerp(const uint8_t *a, const uint8_t *b, float t, int bri) {
+  bleSendRGB((uint8_t)(a[0] + (b[0] - a[0]) * t),
+             (uint8_t)(a[1] + (b[1] - a[1]) * t),
+             (uint8_t)(a[2] + (b[2] - a[2]) * t), bri);
+}
+
+static void fxStep() {
+  static int phase = 0, sub = 0, lastFx = -1;
+  if (g_fxRestart || g_fx != lastFx) { phase = sub = 0; lastFx = g_fx; g_fxRestart = false; }
+
+  int fx  = g_fx;
+  int bri = constrain((int)g_v, 0, 100);
+  int a   = constrain((int)g_fxColA, 0, 6);
+  int b   = constrain((int)g_fxColB, 0, 6);
+
+  switch (fx) {
+    case FX_7JUMP:
+      bleSendRGB(FX_RGB[phase % 7][0], FX_RGB[phase % 7][1], FX_RGB[phase % 7][2], bri);
+      phase++;
+      fxDelay(fxScaledMs(0.5f));
+      break;
+
+    case FX_7STROBE: {
+      const uint8_t *c = FX_RGB[phase % 7];
+      bleSendRGB(c[0], c[1], c[2], sub == 0 ? bri : 0);
+      if (sub) phase++;
+      sub ^= 1;
+      fxDelay(fxScaledMs(0.09f));
+      break;
+    }
+
+    case FX_7FADE:
+      fxLerp(FX_RGB[phase % 7], FX_RGB[(phase + 1) % 7], sub / 40.0f, bri);
+      if (++sub > 40) { sub = 0; phase++; }
+      fxDelay(fxScaledMs(0.05f));
+      break;
+
+    case FX_2FADE: {
+      const uint8_t *from = (phase & 1) ? FX_RGB[b] : FX_RGB[a];
+      const uint8_t *to   = (phase & 1) ? FX_RGB[a] : FX_RGB[b];
+      fxLerp(from, to, sub / 50.0f, bri);
+      if (++sub > 50) { sub = 0; phase++; }
+      fxDelay(fxScaledMs(0.05f));
+      break;
+    }
+
+    case FX_BREATHE: {
+      int step = (phase & 1) ? sub : (50 - sub);        // peak -> 0 -> peak
+      bleSendRGB(FX_RGB[a][0], FX_RGB[a][1], FX_RGB[a][2], bri * step / 50);
+      if (++sub > 50) { sub = 0; phase++; }
+      fxDelay(fxScaledMs(0.035f));
+      break;
+    }
+
+    case FX_1BLINK:
+      bleSendRGB(FX_RGB[a][0], FX_RGB[a][1], FX_RGB[a][2], sub == 0 ? bri : 0);
+      sub ^= 1;
+      fxDelay(fxScaledMs(0.18f));
+      break;
+  }
+  if (phase >= 5040) phase -= 5040;      // keep it bounded (5040 is even & /7)
+}
+
 static void bleDoConnect() {
   g_bleState = BLE_SCANNING;
 
@@ -228,6 +346,7 @@ static void bleDoDisconnect() {
   g_writeChr = nullptr;
   g_bleState = BLE_IDLE;
   g_lampOn   = -1;
+  g_fx       = FX_NONE;
 }
 
 static void bleTask(void *) {
@@ -238,6 +357,13 @@ static void bleTask(void *) {
 
   bool autoReconnect  = false;        // keep trying after an unexpected drop
   int  reconnectTries = 0;
+
+  // --- auto-connect on boot : one try + two retries ---
+  autoReconnect = true;
+  for (int t = 0; t < 3 && g_bleState != BLE_CONNECTED; t++) {
+    if (t) vTaskDelay(pdMS_TO_TICKS(1500));
+    bleDoConnect();
+  }
 
   for (;;) {
     uint8_t evt;
@@ -251,6 +377,10 @@ static void bleTask(void *) {
         case EVT_POWER_OFF:  if (bleWrite(PKT_POWER_OFF, 21)) g_lampOn = 0;
                              g_powerCmdAt = millis();                        break;
       }
+    }
+    if (g_bleState == BLE_CONNECTED && g_fx != FX_NONE) {
+      fxStep();                       // one animation frame, self-paced
+      continue;
     }
     if (g_bleState == BLE_CONNECTED && g_colorDirty) {
       g_colorDirty = false;
@@ -424,7 +554,16 @@ static lv_obj_t  *ui_power;
 static lv_obj_t  *ui_chips[PRESET_COUNT];
 static lv_color_t *s_wheelBuf = nullptr;
 
+static lv_obj_t  *scr_main;
+static lv_obj_t  *scr_fx;
+static lv_obj_t  *ui_fxBtn[6];
+static lv_obj_t  *ui_fxSwA[7];
+static lv_obj_t  *ui_fxSwB[7];
+static lv_obj_t  *ui_fxSpeedLbl;
+static lv_obj_t  *ui_fxStatus;
+
 static int  s_lastUiState   = -1;
+static int  s_lastFxShown   = -99;    // FxId last reflected in the effects UI
 static int  s_activePreset  = -1;      // which preset chip is highlighted, -1 = none
 static int  s_wheelZone     = -1;      // during a drag: 0 = disc, 1 = ring, -1 = none
 static bool s_suppressPower  = false;  // stop programmatic toggles re-firing the cb
@@ -541,6 +680,7 @@ static void onWheelTouch(lv_event_t *e) {
     s_wheelZone = (d > WHEEL_ROUT + 12) ? -1 : (d >= WHEEL_RHIT ? 1 : 0);
   if (s_wheelZone < 0) return;
 
+  g_fx = FX_NONE;                         // manual control cancels any effect
   if (s_wheelZone == 1) {                 // outer ring: angle = hue
     g_h = screenAngToHue(atan2f(dy, dx) * 57.2957795f);
   } else {                                // inner disc: vertical = saturation
@@ -556,10 +696,11 @@ static void onWheelTouch(lv_event_t *e) {
 
 static void onBright(lv_event_t *e) {
   g_v = lv_slider_get_value(ui_bright);
-  pushColor();
+  pushColor();                            // effects read g_v live, so no need to stop them
 }
 
 static void onPreset(lv_event_t *e) {
+  g_fx = FX_NONE;
   int idx = (int)(intptr_t)lv_event_get_user_data(e);
   uint32_t hex = PRESETS[idx].hex;
   int h, s, v; rgbToHsv(hex, h, s, v);
@@ -582,6 +723,7 @@ static void onConnect(lv_event_t *e) {
   int st = g_bleState;
   if (st == BLE_SCANNING || st == BLE_CONNECTING) return;
   bool active = (st == BLE_CONNECTED || st == BLE_RECONNECTING);
+  if (active) g_fx = FX_NONE;
   bleQueue(active ? EVT_DISCONNECT : EVT_CONNECT);
 }
 
@@ -602,6 +744,25 @@ static void onPower(lv_event_t *e) {
 
 /* ---- status poll (runs in the LVGL thread) --------------------------- */
 
+// mirror g_fx into the effects screen (called from statusTimer + the fx buttons)
+static void fxRefresh() {
+  int fx = g_fx;
+  if (fx == s_lastFxShown) return;
+  s_lastFxShown = fx;
+  for (int i = 0; i < 6; i++)
+    lv_obj_set_style_bg_color(ui_fxBtn[i], (fx == i + 1) ? C::blue : C::card2, 0);
+  const char *n = "No effect";
+  switch (fx) {
+    case FX_7FADE:   n = "Playing: Seven-Colour Fade";   break;
+    case FX_7STROBE: n = "Playing: Seven-Colour Strobe"; break;
+    case FX_7JUMP:   n = "Playing: Seven-Colour Jump";   break;
+    case FX_BREATHE: n = "Playing: Breathe";             break;
+    case FX_1BLINK:  n = "Playing: Blink";               break;
+    case FX_2FADE:   n = "Playing: Two-Colour Fade";     break;
+  }
+  lv_label_set_text(ui_fxStatus, n);
+}
+
 static void statusTimer(lv_timer_t *) {
   // Keep the Power switch mirroring the lamp's real state (g_lampOn is fed by
   // the lamp's status notifications).  -1 (unknown / disconnected) shows as off.
@@ -614,6 +775,8 @@ static void statusTimer(lv_timer_t *) {
     s_suppressPower = false;
   }
 
+  fxRefresh();
+
   int st = g_bleState;
   if (st == s_lastUiState) return;
   s_lastUiState = st;
@@ -624,8 +787,8 @@ static void statusTimer(lv_timer_t *) {
     case BLE_SCANNING:     txt = "Scanning...";     dot = C::yellow; btn = "Connect";    break;
     case BLE_CONNECTING:   txt = "Connecting...";   dot = C::yellow; btn = "Connect";    break;
     case BLE_RECONNECTING: txt = "Reconnecting..."; dot = C::yellow; btn = "Stop";       break;
-    case BLE_FAILED:       txt = "Couldn't connect - edits apply on connect"; dot = C::red;   btn = "Retry";   break;
-    default:              txt = "Not connected - edits apply on connect";     dot = C::faint; btn = "Connect"; break;
+    case BLE_FAILED:       txt = "Couldn't connect"; dot = C::red;   btn = "Retry";   break;
+    default:              txt = "Not connected";    dot = C::faint;  btn = "Connect"; break;
   }
   lv_label_set_text(ui_statusText, txt);
   lv_label_set_text(ui_connectLbl, btn);
@@ -657,9 +820,13 @@ static lv_obj_t *label(lv_obj_t *parent, const char *txt,
 }
 
 
+static void onEffectsBtn(lv_event_t *e) { lv_scr_load(scr_fx); }
+static void onFxBack(lv_event_t *e)     { lv_scr_load(scr_main); }
+
 static void buildUI() {
   Serial.println("[Sunset] buildUI: enter"); Serial.flush();
   lv_obj_t *scr = lv_scr_act();
+  scr_main = scr;
   lv_obj_set_style_bg_color(scr, C::bg, 0);
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
   lv_obj_set_style_text_font(scr, &lv_font_montserrat_16, 0);
@@ -695,6 +862,15 @@ static void buildUI() {
   lv_obj_set_style_bg_color(ui_power, C::green, LV_PART_INDICATOR | LV_STATE_CHECKED);
   lv_obj_set_style_bg_color(ui_power, C::white, LV_PART_KNOB);
   lv_obj_add_event_cb(ui_power, onPower, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_t *fxBtn = lv_btn_create(scr);
+  lv_obj_set_size(fxBtn, 130, 48);
+  lv_obj_align(fxBtn, LV_ALIGN_TOP_RIGHT, -360, 16);
+  lv_obj_set_style_radius(fxBtn, 24, 0);
+  lv_obj_set_style_bg_color(fxBtn, C::card2, 0);
+  lv_obj_set_style_shadow_width(fxBtn, 0, 0);
+  lv_obj_add_event_cb(fxBtn, onEffectsBtn, LV_EVENT_CLICKED, nullptr);
+  lv_obj_center(label(fxBtn, "Effects", &lv_font_montserrat_16, C::text));
 
   /* ---- left card : the big HSV wheel --------------------------- */
   lv_obj_t *left = card(scr, 400, 384);
@@ -789,6 +965,141 @@ static void buildUI() {
 
 
 /* ============================================================================
+ *  3b.  EFFECTS SCREEN
+ * ==========================================================================*/
+
+static void onFxPick(lv_event_t *e) {
+  if (g_bleState != BLE_CONNECTED) return;
+  g_fx = (int)(intptr_t)lv_event_get_user_data(e);   // FxId 1..6
+  g_fxRestart = true;
+  fxRefresh();
+}
+static void onFxStop(lv_event_t *e) { g_fx = FX_NONE; fxRefresh(); }
+
+static void onFxSpeed(lv_event_t *e) {
+  g_fxSpeed = lv_slider_get_value(lv_event_get_target(e));
+  lv_label_set_text_fmt(ui_fxSpeedLbl, "Speed  %d%%", (int)g_fxSpeed);
+}
+static void onFxBright(lv_event_t *e) {
+  g_v = lv_slider_get_value(lv_event_get_target(e));
+  lv_slider_set_value(ui_bright, g_v, LV_ANIM_OFF);
+  refreshColor();
+}
+static void onFxColA(lv_event_t *e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  g_fxColA = idx;
+  for (int i = 0; i < 7; i++)
+    lv_obj_set_style_border_color(ui_fxSwA[i], i == idx ? C::white : C::card3, 0);
+  if (g_fx == FX_BREATHE || g_fx == FX_1BLINK || g_fx == FX_2FADE) g_fxRestart = true;
+}
+static void onFxColB(lv_event_t *e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  g_fxColB = idx;
+  for (int i = 0; i < 7; i++)
+    lv_obj_set_style_border_color(ui_fxSwB[i], i == idx ? C::white : C::card3, 0);
+  if (g_fx == FX_2FADE) g_fxRestart = true;
+}
+
+static void fxSwatchRow(lv_obj_t **arr, lv_event_cb_t cb, int y, int sel) {
+  for (int i = 0; i < 7; i++) {
+    lv_obj_t *s = lv_obj_create(scr_fx);
+    lv_obj_set_size(s, 46, 46);
+    lv_obj_align(s, LV_ALIGN_TOP_LEFT, 28 + i * 58, y);
+    lv_obj_set_style_radius(s, 23, 0);
+    lv_obj_set_style_bg_color(s, lv_color_make(FX_RGB[i][0], FX_RGB[i][1], FX_RGB[i][2]), 0);
+    lv_obj_set_style_border_width(s, 3, 0);
+    lv_obj_set_style_border_color(s, i == sel ? C::white : C::card3, 0);
+    lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s, cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    arr[i] = s;
+  }
+}
+
+static void buildFxUI() {
+  scr_fx = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(scr_fx, C::bg, 0);
+  lv_obj_set_style_bg_opa(scr_fx, LV_OPA_COVER, 0);
+  lv_obj_set_style_text_font(scr_fx, &lv_font_montserrat_16, 0);
+  lv_obj_clear_flag(scr_fx, LV_OBJ_FLAG_SCROLLABLE);
+
+  /* header */
+  lv_obj_align(label(scr_fx, "Effects", &lv_font_montserrat_28, C::text),
+               LV_ALIGN_TOP_LEFT, 28, 14);
+
+  lv_obj_t *back = lv_btn_create(scr_fx);
+  lv_obj_set_size(back, 120, 48);
+  lv_obj_align(back, LV_ALIGN_TOP_RIGHT, -22, 14);
+  lv_obj_set_style_radius(back, 24, 0);
+  lv_obj_set_style_bg_color(back, C::white, 0);
+  lv_obj_set_style_shadow_width(back, 0, 0);
+  lv_obj_add_event_cb(back, onFxBack, LV_EVENT_CLICKED, nullptr);
+  lv_obj_center(label(back, "Back", &lv_font_montserrat_20, C::ink));
+
+  lv_obj_t *stop = lv_btn_create(scr_fx);
+  lv_obj_set_size(stop, 120, 48);
+  lv_obj_align(stop, LV_ALIGN_TOP_RIGHT, -156, 14);
+  lv_obj_set_style_radius(stop, 24, 0);
+  lv_obj_set_style_bg_color(stop, C::card2, 0);
+  lv_obj_set_style_shadow_width(stop, 0, 0);
+  lv_obj_add_event_cb(stop, onFxStop, LV_EVENT_CLICKED, nullptr);
+  lv_obj_center(label(stop, "Stop", &lv_font_montserrat_20, C::text));
+
+  /* speed + brightness */
+  ui_fxSpeedLbl = label(scr_fx, "Speed  50%", &lv_font_montserrat_16, C::muted);
+  lv_obj_align(ui_fxSpeedLbl, LV_ALIGN_TOP_LEFT, 28, 74);
+  lv_obj_t *spd = lv_slider_create(scr_fx);
+  lv_obj_set_size(spd, 500, 16);
+  lv_obj_align(spd, LV_ALIGN_TOP_LEFT, 28, 100);
+  lv_slider_set_range(spd, 0, 100);
+  lv_slider_set_value(spd, g_fxSpeed, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(spd, C::card3, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(spd, C::blue, LV_PART_INDICATOR);
+  lv_obj_add_event_cb(spd, onFxSpeed, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  lv_obj_align(label(scr_fx, "Brightness", &lv_font_montserrat_16, C::muted),
+               LV_ALIGN_TOP_LEFT, 560, 74);
+  lv_obj_t *br = lv_slider_create(scr_fx);
+  lv_obj_set_size(br, 200, 16);
+  lv_obj_align(br, LV_ALIGN_TOP_LEFT, 560, 100);
+  lv_slider_set_range(br, 1, 100);
+  lv_slider_set_value(br, g_v, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(br, C::card3, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(br, C::text, LV_PART_INDICATOR);
+  lv_obj_add_event_cb(br, onFxBright, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  /* effect buttons (2 rows x 3) */
+  static const char *NM[6] = {
+    "Seven-Colour Fade", "Seven-Colour Strobe", "Seven-Colour Jump",
+    "Breathe", "Blink", "Two-Colour Fade"
+  };
+  for (int i = 0; i < 6; i++) {
+    lv_obj_t *b = lv_btn_create(scr_fx);
+    lv_obj_set_size(b, 240, 66);
+    lv_obj_align(b, LV_ALIGN_TOP_LEFT, 28 + (i % 3) * 252, 136 + (i / 3) * 78);
+    lv_obj_set_style_radius(b, 16, 0);
+    lv_obj_set_style_bg_color(b, C::card2, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_add_event_cb(b, onFxPick, LV_EVENT_CLICKED, (void *)(intptr_t)(i + 1));
+    lv_obj_center(label(b, NM[i], &lv_font_montserrat_16, C::text));
+    ui_fxBtn[i] = b;
+  }
+
+  /* colour swatches */
+  lv_obj_align(label(scr_fx, "COLOUR  (Breathe / Blink / Fade A)",
+                     &lv_font_montserrat_16, C::faint), LV_ALIGN_TOP_LEFT, 28, 296);
+  fxSwatchRow(ui_fxSwA, onFxColA, 320, g_fxColA);
+
+  lv_obj_align(label(scr_fx, "COLOUR B  (Two-Colour Fade)",
+                     &lv_font_montserrat_16, C::faint), LV_ALIGN_TOP_LEFT, 28, 376);
+  fxSwatchRow(ui_fxSwB, onFxColB, 400, g_fxColB);
+
+  ui_fxStatus = label(scr_fx, "No effect", &lv_font_montserrat_16, C::muted);
+  lv_obj_align(ui_fxStatus, LV_ALIGN_TOP_LEFT, 28, 452);
+}
+
+
+/* ============================================================================
  *  4.  setup / loop
  * ==========================================================================*/
 
@@ -871,6 +1182,7 @@ void setup() {
   if (!s_wheelBuf) { while (true) delay(1000); }
 
   buildUI();
+  buildFxUI();
   lv_timer_create(statusTimer, 200, nullptr);
   Serial.println("[Sunset] .. refr"); Serial.flush();
 

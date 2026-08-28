@@ -53,13 +53,17 @@ Set `LAMP_MAC` near the top of the `.ino` to your lamp's address if it isn't
 
 ## Using it
 
-- **Connect** (top right) — close any phone/PC app first; the lamp allows one
-  connection at a time. Drops reconnect automatically.
+- **Connects on boot** (2 retries), then reconnects automatically if it drops.
+  Close any phone/PC app first — the lamp allows one connection at a time.
 - **Wheel** — outer ring picks hue, inner disc picks saturation.
 - **Slider** — brightness.
 - **Presets** — tap to jump to a colour (also powers the lamp on).
+- **Effects** (button, top right) — animated modes rendered from the board:
+  seven-colour fade / strobe / jump, plus breathe, blink and a two-colour fade,
+  with speed and per-colour pickers. "Stop" ends it; touching the wheel does too.
 
 Controls still work while disconnected; changes apply once you connect.
+Screen sleeps after 5 min untouched — tap to wake.
 
 ---
 
