@@ -313,6 +313,24 @@ static void backlight(bool on) {
   if (expander) expander->digitalWrite(EXP_LCD_BL, on ? HIGH : LOW);
 }
 
+// --- screen sleep : blank the backlight after a spell with no touch, wake on
+//     the next touch (that touch is swallowed so it can't hit a control). ---
+#define SLEEP_AFTER_MS  (1UL * 60 * 1000)     // 5 minutes untouched
+static uint32_t s_lastTouchMs = 0;
+static bool     s_asleep      = false;
+
+static void screenSleep() {
+  if (s_asleep) return;
+  s_asleep = true;
+  backlight(false);
+}
+static void screenWake() {
+  s_lastTouchMs = millis();
+  if (!s_asleep) return;
+  s_asleep = false;
+  backlight(true);
+}
+
 // GT911 capacitive touch.
 #define TOUCH_SDA 8
 #define TOUCH_SCL 9
@@ -342,6 +360,12 @@ static void lvglFlush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *px)
 static void lvglTouch(lv_indev_drv_t *drv, lv_indev_data_t *data) {
   TOUCHINFO ti;
   if (bbct.getSamples(&ti) && ti.count > 0) {
+    if (s_asleep) {                 // first touch just wakes the screen
+      screenWake();
+      data->state = LV_INDEV_STATE_RELEASED;
+      return;
+    }
+    s_lastTouchMs = millis();
     data->state   = LV_INDEV_STATE_PRESSED;
     data->point.x = constrain(ti.x[0], 0, TFT_W - 1);
     data->point.y = constrain(ti.y[0], 0, TFT_H - 1);
@@ -852,6 +876,7 @@ void setup() {
 
   lv_refr_now(nullptr);
   backlight(true);
+  s_lastTouchMs = millis();          // start the sleep countdown from boot
   Serial.println("[Sunset] .. ui up"); Serial.flush();
 
   // --- Bluetooth on the other core ---
@@ -863,5 +888,7 @@ void setup() {
 
 void loop() {
   lv_timer_handler();
+  if (!s_asleep && millis() - s_lastTouchMs > SLEEP_AFTER_MS)
+    screenSleep();
   delay(5);
 }

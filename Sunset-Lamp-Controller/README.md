@@ -143,8 +143,14 @@ Serial Monitor baud rate: **115200**.
 - When disconnected the controls still work — a hint says changes apply once you
   connect, and they're pushed the moment the link is up.
 
-Colour + brightness changes are rate-limited to ~30/s so dragging stays smooth
+Colour + brightness changes are rate-limited to ~25/s so dragging stays smooth
 and the lamp keeps up.
+
+**Screen sleep** — after 5 minutes with no touch the backlight blanks (the lamp
+and the BLE link stay up). The next touch just wakes the screen; it doesn't
+press anything. Change `SLEEP_AFTER_MS` in the `.ino` to adjust. This is an IPS
+LCD, not OLED, so it won't permanently burn in — sleep is mainly for backlight
+lifespan, heat, and power on a 24/7 install.
 
 ---
 
