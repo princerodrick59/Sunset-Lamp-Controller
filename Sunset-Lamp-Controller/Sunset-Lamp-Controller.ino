@@ -105,7 +105,7 @@ class ClientCB : public NimBLEClientCallbacks {
 };
 static ClientCB g_clientCB;
 
-static volatile int g_dumpNotify = 12;      // dump this many frames, then stop
+static volatile int g_dumpNotify = 3;       // dump this many frames, then stop
 
 static inline int hexVal(uint8_t c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -176,15 +176,18 @@ static void bleDoConnect() {
   if (!g_client) {
     g_client = NimBLEDevice::createClient();
     g_client->setClientCallbacks(&g_clientCB, false);
-    g_client->setConnectionParams(12, 12, 0, 200);
+    // 30 ms interval + slave latency 4: when nothing is happening the lamp may
+    // skip up to 4 events (~150 ms of radio quiet), but it still wakes on the
+    // very next event when we send.  Fewer radio bursts = fewer LCD line drops.
+    g_client->setConnectionParams(24, 24, 4, 600);
     g_client->setConnectTimeout(10);
   }
 
   NimBLEScan *scan = NimBLEDevice::getScan();
-  scan->setActiveScan(true);
+  scan->setActiveScan(false);       // passive: less radio churn during the scan
   scan->setInterval(80);
-  scan->setWindow(60);
-  NimBLEScanResults res = scan->start(6, false);
+  scan->setWindow(40);
+  NimBLEScanResults res = scan->start(4, false);
 
   NimBLEAdvertisedDevice *target = nullptr;
   for (auto *d : res) {
@@ -229,12 +232,12 @@ static void bleDoDisconnect() {
 
 static void bleTask(void *) {
   NimBLEDevice::init("Sunset");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P3);   // 0 dBm is plenty for a lamp in the room;
+                                            // max power spikes noise into the LCD
   NimBLEDevice::setMTU(247);         // so the lamp's status frame fits one notification
 
-  uint32_t lastQuery = 0, lastPowerCmd = 0;
-  bool     autoReconnect = false;     // keep trying after an unexpected drop
-  int      reconnectTries = 0;
+  bool autoReconnect  = false;        // keep trying after an unexpected drop
+  int  reconnectTries = 0;
 
   for (;;) {
     uint8_t evt;
@@ -244,23 +247,18 @@ static void bleTask(void *) {
                              if (g_bleState != BLE_CONNECTED) bleDoConnect(); break;
         case EVT_DISCONNECT: autoReconnect = false; bleDoDisconnect();       break;
         case EVT_POWER_ON:   if (bleWrite(PKT_POWER_ON,  21)) g_lampOn = 1;
-                             lastPowerCmd = g_powerCmdAt = millis();         break;
+                             g_powerCmdAt = millis();                        break;
         case EVT_POWER_OFF:  if (bleWrite(PKT_POWER_OFF, 21)) g_lampOn = 0;
-                             lastPowerCmd = g_powerCmdAt = millis();         break;
+                             g_powerCmdAt = millis();                        break;
       }
     }
     if (g_bleState == BLE_CONNECTED && g_colorDirty) {
       g_colorDirty = false;
       bleSendColor();
-      vTaskDelay(pdMS_TO_TICKS(35));   // rate-limit while a control is dragged
+      vTaskDelay(pdMS_TO_TICKS(40));   // rate-limit while a control is dragged
     }
-    // Poll the lamp's power state now and then, but not right after we changed
-    // it ourselves (the notify from our own command already covers that).
-    if (g_bleState == BLE_CONNECTED &&
-        millis() - lastQuery > 5000 && millis() - lastPowerCmd > 2000) {
-      lastQuery = millis();
-      bleWrite(PKT_STATE_QUERY, sizeof(PKT_STATE_QUERY));
-    }
+    // No periodic state poll: the lamp already pushes its 0x81 frame ~1/s, and
+    // we set g_lampOn optimistically, so polling would just add radio traffic.
     // --- auto-reconnect after an unexpected drop --------------------------
     if (autoReconnect &&
         (g_bleState == BLE_DISCONNECTED || g_bleState == BLE_RECONNECTING)) {
@@ -375,7 +373,7 @@ namespace C {                        // palette — mirrors the Python Theme cla
 
 struct Preset { const char *name; uint32_t hex; };
 static const Preset PRESETS[] = {
-  {"Sunset", 0xff5c23}, {"Rose",  0xff4f8b},
+  {"Sunset", 0xff5900}, {"Rose",  0xff4f8b},
   {"Ocean",  0x0a84ff}, {"White", 0xffffff},
 };
 static const int PRESET_COUNT = sizeof(PRESETS) / sizeof(PRESETS[0]);
@@ -394,6 +392,7 @@ static lv_obj_t  *ui_hueDot;
 static lv_obj_t  *ui_satDot;
 static lv_obj_t  *ui_bright;
 static lv_obj_t  *ui_pct;
+static lv_obj_t  *ui_hex;
 static lv_obj_t  *ui_statusDot;
 static lv_obj_t  *ui_statusText;
 static lv_obj_t  *ui_connectLbl;
@@ -461,7 +460,13 @@ static void wheelDrawDisc() {
       s_wheelBuf[y * WHEEL_SZ + x] = row;           // whole row is one colour
     }
   }
-  lv_obj_invalidate(ui_wheel);
+  // invalidate only the disc, not the whole 340x340 canvas — a full re-blit is a
+  // ~230 KB burst to the framebuffer and that alone can make the panel slip.
+  lv_area_t wc; lv_obj_get_coords(ui_wheel, &wc);
+  int cx = (wc.x1 + wc.x2) / 2, cy = (wc.y1 + wc.y2) / 2;
+  lv_area_t da = { (lv_coord_t)(cx - WHEEL_RDISC), (lv_coord_t)(cy - WHEEL_RDISC),
+                   (lv_coord_t)(cx + WHEEL_RDISC), (lv_coord_t)(cy + WHEEL_RDISC) };
+  lv_obj_invalidate_area(ui_wheel, &da);
 }
 
 static void wheelUpdateDots() {
@@ -480,11 +485,14 @@ static void rgbToHsv(uint32_t hex, int &h, int &s, int &v) {
   h = hsv.h; s = hsv.s; v = hsv.v;
 }
 
-static void refreshColor() {            // brightness bar tracks the live colour
-  lv_obj_set_style_bg_color(ui_bright,
-      lv_color_hsv_to_rgb((uint16_t)g_h, (uint8_t)g_s, 100), LV_PART_INDICATOR);
+static void refreshColor() {            // brightness bar + hex track the live colour
+  lv_color_t c = lv_color_hsv_to_rgb((uint16_t)g_h, (uint8_t)g_s, 100);
+  lv_obj_set_style_bg_color(ui_bright, c, LV_PART_INDICATOR);
   lv_label_set_text_fmt(ui_pct, "%d%%", (int)g_v);
   lv_obj_align(ui_pct, LV_ALIGN_CENTER, 0, 0);   // re-centre after the digits change
+  uint32_t v = lv_color_to32(c);
+  lv_label_set_text_fmt(ui_hex, "#%02X%02X%02X",
+                        (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v);
 }
 
 static void pushColor() {               // hand the current intent to core 0
@@ -690,6 +698,10 @@ static void buildUI() {
     lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
     if (k == 0) ui_hueDot = dot; else ui_satDot = dot;
   }
+
+  // hex readout in the top-left corner of the wheel's square
+  ui_hex = label(left, "#FFFFFF", &lv_font_montserrat_14, C::muted);
+  lv_obj_align_to(ui_hex, ui_wheel, LV_ALIGN_TOP_LEFT, 2, 2);
 
   Serial.println("[Sunset] buildUI: wheel paint"); Serial.flush();
   wheelDrawRing();
